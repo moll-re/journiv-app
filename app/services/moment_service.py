@@ -10,6 +10,7 @@ from typing import Any, List, Optional, Tuple
 from sqlalchemy import String, and_, cast, extract, func, or_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Session, col, delete, select
 
 from app.core.db_utils import normalize_uuid_list
@@ -19,6 +20,8 @@ from app.core.time_utils import ensure_utc, local_date_for_user, utc_now
 from app.models.activity import Activity
 from app.models.entry import Entry
 from app.models.goal import GoalLog
+from app.models.journal import Journal
+from app.models.journal_member import JournalMember
 from app.models.moment import Moment, MomentMoodActivity
 from app.models.moment_person_link import MomentPersonLink
 from app.models.moment_tag_link import MomentTagLink
@@ -33,7 +36,7 @@ from app.schemas.moment import (
     PeopleMatch,
 )
 from app.services.goal_service import GoalService
-from app.services.moment_lookup import get_owned_moment
+from app.services.moment_lookup import get_accessible_moment, get_owned_moment
 
 
 class MomentService:
@@ -61,16 +64,47 @@ class MomentService:
             self.session.rollback()
             raise
 
+    @staticmethod
+    def _visible_to_user_condition(user_id: uuid.UUID) -> ColumnElement[bool]:
+        """Match personal moments, owned-journal entries, and published shared entries."""
+        member_has_access = (
+            select(JournalMember.id)
+            .where(
+                JournalMember.journal_id == Journal.id,
+                JournalMember.user_id == user_id,
+            )
+            .exists()
+        )
+        shared_moment_ids = (
+            select(Entry.moment_id)
+            .join(Journal, col(Journal.id) == col(Entry.journal_id))
+            .where(
+                or_(
+                    col(Journal.user_id) == user_id,
+                    and_(
+                        member_has_access,
+                        # Membership exposes finished writing only.
+                        col(Entry.is_draft).is_(False),
+                    ),
+                )
+            )
+        )
+        return or_(
+            col(Moment.user_id) == user_id,
+            col(Moment.id).in_(shared_moment_ids),
+        )
+
     def _get_owned_moment(self, user_id: uuid.UUID, moment_id: uuid.UUID) -> Moment:
         return get_owned_moment(self.session, user_id, moment_id)
 
     def _get_owned_moment_with_relations(
         self, user_id: uuid.UUID, moment_id: uuid.UUID
     ) -> Moment:
-        return get_owned_moment(
+        return get_accessible_moment(
             self.session,
             user_id,
             moment_id,
+            edit=False,
             options=[
                 selectinload(Moment.entry),  # type: ignore[arg-type]
                 selectinload(Moment.tags),  # type: ignore[arg-type]
@@ -289,7 +323,7 @@ class MomentService:
         """Delete user moments that no longer have meaningful content."""
         statement = (
             select(Moment)
-            .where(Moment.user_id == user_id)
+            .where(self._visible_to_user_condition(user_id))
             .options(
                 selectinload(Moment.entry),  # type: ignore[arg-type]
                 selectinload(Moment.tags),  # type: ignore[arg-type]
@@ -830,7 +864,7 @@ class MomentService:
     def _base_moment_statement(self, user_id: uuid.UUID) -> Any:
         return (
             select(Moment)
-            .where(Moment.user_id == user_id)
+            .where(self._visible_to_user_condition(user_id))
             .options(
                 selectinload(Moment.entry),  # type: ignore[arg-type]
                 selectinload(Moment.tags),  # type: ignore[arg-type]
@@ -1114,7 +1148,7 @@ class MomentService:
         """Get moments for a user with filtering."""
         statement = (
             select(Moment)
-            .where(Moment.user_id == user_id)
+            .where(self._visible_to_user_condition(user_id))
             .options(
                 selectinload(Moment.entry),  # type: ignore[arg-type]
                 selectinload(Moment.tags),  # type: ignore[arg-type]
@@ -1165,7 +1199,7 @@ class MomentService:
         end_date: Optional[date] = None,
         journal_id: Optional[uuid.UUID] = None,
     ) -> List[Moment]:
-        statement = select(Moment).where(Moment.user_id == user_id)
+        statement = select(Moment).where(self._visible_to_user_condition(user_id))
         if journal_id:
             statement = statement.join(
                 Entry, col(Entry.moment_id) == col(Moment.id)

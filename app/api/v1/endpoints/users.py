@@ -4,7 +4,8 @@ User endpoints.
 import hashlib
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlmodel import col, select
 from pydantic import BaseModel
 from sqlmodel import Session
 
@@ -19,9 +20,32 @@ from app.schemas.user import (
     UserSettingsUpdate,
     UserUpdate,
 )
+from app.schemas.journal import UserSearchResponse
 from app.services.user_service import UserService
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+
+@router.get("/search", response_model=list[UserSearchResponse])
+async def search_users(
+    q: Annotated[str, Query(min_length=2, max_length=100)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[Session, Depends(get_session)],
+    limit: Annotated[int, Query(ge=1, le=25)] = 10,
+):
+    """Search active instance users for a journal-sharing recipient."""
+    query = q.strip()
+    if len(query) < 2:
+        raise HTTPException(status_code=422, detail="Search query must contain at least two characters")
+    pattern = f"%{query}%"
+    users = session.exec(
+        select(User)
+        .where(User.is_active.is_(True), User.id != current_user.id)
+        .where(col(User.name).ilike(pattern) | col(User.email).ilike(pattern))
+        .order_by(User.name, User.email)
+        .limit(limit)
+    ).all()
+    return [UserSearchResponse(id=user.id, name=user.name, email=str(user.email)) for user in users]
 
 
 class DeleteResponse(BaseModel):
